@@ -1,18 +1,15 @@
 name: Deploy new version
 
 on:
-    push:
-        branch:
-          - public
-        # tags:
-          # - "v*.*"
-          
+  push:
+    branches: [ "public"]
+
 env:
-    APP_NAME: kassiopeia
+  APP_NAME: kassiopeia
     
 # Allow this workflow to write back to the repository
 permissions:
-    contents: write
+  contents: write
     
 # Build binary and send to releases
 jobs:
@@ -31,10 +28,10 @@ jobs:
             run: docker create --name pico-builder-container pico-builder-image
             
           - name: Copy out .uf2 file
-            run: docker cp pico-builder-container:/project/src/build/${APP_NAME}.uf2 ./${APP_NAME}.uf2
+            run: docker cp pico-builder-container:/project/build/${APP_NAME}.uf2 ./${APP_NAME}.uf2
 
           - name: Copy out .bin file
-            run: docker cp pico-builder-container:/project/src/build/${APP_NAME}.bin ./${APP_NAME}.bin
+            run: docker cp pico-builder-container:/project/build/${APP_NAME}.bin ./${APP_NAME}.bin
             
           - name: Put environment variable into the env context
             run: echo "app_name=$APP_NAME" >> $GITHUB_ENV
@@ -43,7 +40,7 @@ jobs:
             uses: softprops/action-gh-release@v1
             if: startsWith(github.ref, 'refs/tags/')
             with:
-                files: 
-                  - ${{ env.app_name }}.uf2
-                  - ${{ env.app_name }}.bin
+                files: |
+                    ${{ env.app_name }}.uf2
+                    ${{ env.app_name }}.bin
                 body_path: CHANGELOG.md
