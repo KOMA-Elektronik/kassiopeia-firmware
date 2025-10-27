@@ -20,12 +20,12 @@ RUN \
 ENV PICO_SDK_PATH=/project/pico-sdk/
 
 # Copy in our source files
-COPY src/* /project/src/
+COPY . /project/
 
 # Build project
 RUN \
-    mkdir -p /project/src/build && \
-    cd /project/src/build && \
+    mkdir -p /project/build && \
+    cd /project/build && \
     cmake .. && \
     make kassiopeia
     
