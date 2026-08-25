@@ -1,0 +1,1 @@
+- PR1 has some boards that potentially don't have a functioning SWD port

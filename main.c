@@ -1,5 +1,7 @@
 #include <inttypes.h>
 
+#include <stdio.h>
+
 #include <pico/stdlib.h>
 #include <pico/time.h>
 
@@ -11,6 +13,7 @@
 #include "hardware/uart.h"
 
 #include "system/inc/config.h"
+#include "system/inc/power_monitor.h"
 #include "system/inc/startup_sequence.h"
 
 #include "drivers/inc/adc.h"
@@ -23,7 +26,7 @@
 
 //////////////////////////////////////////////////////////////////////////////////
 //
-// GLOBAL VARIABLES
+// GLOBAL VARIABLES STORED IN RAM
 //
 //////////////////////////////////////////////////////////////////////////////////
 
@@ -36,11 +39,26 @@ midi_notes_cc_t MIDI_LEARNED = {
 		     MIDI_LISTEN_TO_ALL},
     .cc_channel = {MIDI_LISTEN_TO_ALL, MIDI_LISTEN_TO_ALL, MIDI_LISTEN_TO_ALL,
 		   MIDI_LISTEN_TO_ALL}};
-const midi_notes_cc_t* flash_buffer =
-    (midi_notes_cc_t*)(XIP_BASE + MIDI_CONFIG_FLASH_OFFSET);
 Mux4051 MUX;
 struct midi_buffer MIDI_PARSER;
 struct midi_buffer MIDI_LEARN_PARSER;
+
+//////////////////////////////////////////////
+// Power monitoring
+bool pr3_or_higher = false;
+volatile bool power_shut_down = false;
+float max_power_target = MAX_POWER_TARGET;
+power_monitor_state_t POWER_MONITOR = {0};
+//////////////////////////////////////////////
+
+//////////////////////////////////////////////////////////////////////////////////
+//
+// GLOBAL VARIABLES STORED IN FLASH
+//
+//////////////////////////////////////////////////////////////////////////////////
+
+const midi_notes_cc_t* midi_config_flash =
+    (midi_notes_cc_t*)(XIP_BASE + MIDI_CONFIG_FLASH_OFFSET);
 
 //////////////////////////////////////////////////////////////////////////////////
 //
@@ -62,18 +80,261 @@ const uint32_t CV_WATCH_PIN[N_CHANNELS] = {CV_WATCH_PIN_1, CV_WATCH_PIN_2,
 
 const uint32_t LED_PIN[N_CHANNELS] = {LED1, LED2, LED3, LED4};
 
+//////////////////////////////////////////////
+// for PR3 and higher
+
+// Bind the compile-time policy in config.h to the hardware-independent monitor.
+const power_monitor_limits_t POWER_MONITOR_LIMITS = {
+    .continuous_power_w = MAX_POWER_TARGET,
+    .power_overload_budget_j = POWER_OVERLOAD_BUDGET_J,
+    .power_overload_recovery_cap_w = POWER_OVERLOAD_RECOVERY_CAP_W,
+    .continuous_current_a = CONTINUOUS_CURRENT_LIMIT_A,
+    .current_overload_budget_a_s = CURRENT_OVERLOAD_BUDGET_A_S,
+    .current_overload_decay_a = CURRENT_OVERLOAD_DECAY_A,
+    .current_overrange_continuous_limit_s =
+	CURRENT_OVERRANGE_CONTINUOUS_LIMIT_S,
+    .current_overrange_budget_s = CURRENT_OVERRANGE_BUDGET_S,
+    .current_overrange_decay_s_per_s = CURRENT_OVERRANGE_DECAY_S_PER_S,
+};
+
+//////////////////////////////////////////////
+
 //////////////////////////////////////
 // HELPERS
 //////////////////////////////////////
+
+// Immediately de-energize both output types. This is deliberately stronger
+// than clearing ADC control values because MIDI state could otherwise restore
+// a PWM level and an outstanding trigger could leave a pulse pin high.
+static void shut_down_outputs(void)
+{
+	for (out_channel_t ch = CHAN_1; ch < N_CHANNELS; ++ch) {
+		set_pwm(ch, 0);
+		end_pulse(ch);
+	}
+}
 
 // Save MIDI Config to Flash
 void save_midi_config_to_flash(void)
 {
 	uint32_t interrupts = save_and_disable_interrupts();
-	flash_range_erase((MIDI_CONFIG_FLASH_OFFSET), FLASH_PAGE_SIZE);
+	// Disable output-producing IRQs before forcing the pins low; otherwise
+	// one could reassert an output between shut_down_outputs() and the IRQ
+	// mask.
+	shut_down_outputs();
+	flash_range_erase((MIDI_CONFIG_FLASH_OFFSET), sizeof(midi_notes_cc_t));
 	flash_range_program((MIDI_CONFIG_FLASH_OFFSET),
-			    (uint8_t*)(&MIDI_LEARNED), FLASH_PAGE_SIZE);
+			    (uint8_t*)(&MIDI_LEARNED), sizeof(midi_notes_cc_t));
 	restore_interrupts(interrupts);
+}
+
+void toggle_power_led(void)
+{
+	static bool power_led_state = 0;
+	power_led_state ^= 1;
+
+	// Toggle the power LED
+	if (power_led_state)
+		pwm_set_gpio_level(LED_POWER, UINT8_MAX);
+	else
+		pwm_set_gpio_level(LED_POWER, LOW);
+}
+
+#if POWER_MONITOR_DEBUG_LOG
+
+// Return the stable diagnostic text printed on the first trip transition.
+static const char* power_trip_reason_string(power_trip_reason_t reason)
+{
+	switch (reason) {
+	case POWER_TRIP_CURRENT_SENSOR_OVERRANGE:
+		return "sustained/repeated current-sensor overrange";
+	case POWER_TRIP_CURRENT_OVERLOAD:
+		return "accumulated bridge/current overload";
+	case POWER_TRIP_POWER_OVERLOAD:
+		return "accumulated power overload";
+	case POWER_TRIP_NONE:
+	default:
+		return "none";
+	}
+}
+
+#endif
+
+// Atomically latch shutdown against the PWM interrupt and force every output
+// low. Return true only to the caller that performed the first transition so
+// the trip snapshot is printed once rather than on every later sample.
+static bool latch_power_trip(power_trip_reason_t reason)
+{
+	const uint32_t interrupts = save_and_disable_interrupts();
+	const bool newly_tripped = !power_shut_down;
+
+	if (newly_tripped) {
+		POWER_MONITOR.trip_reason = reason;
+		power_shut_down = true;
+		shut_down_outputs();
+	}
+
+	restore_interrupts(interrupts);
+	return newly_tripped;
+}
+
+// Convert one sequential post-bridge ADC pair, advance the protection model
+// using real elapsed time, and handle trip/logging side effects. Protection
+// runs on every call; POWER_MON_READOUT_TIME controls only LED/USB reporting.
+static void process_power_sample(uint16_t current_raw, uint16_t voltage_raw)
+{
+	static uint64_t previous_sample_us = 0;
+	static uint64_t next_readout_us = 0;
+	static float previous_power_w = 0.0f;
+	static float previous_current_a = 0.0f;
+	static uint16_t previous_current_raw = 0;
+	static uint16_t previous_voltage_raw = 0;
+	static bool current_sensor_overrange = false;
+	static bool previous_current_sensor_overrange = false;
+
+#if POWER_MONITOR_DEBUG_LOG
+
+	static uint16_t peak_current_raw = 0;
+	static bool interval_overrange_seen = false;
+	static float interval_energy_j = 0.0f;
+	static float interval_elapsed_s = 0.0f;
+	static float interval_peak_power_w = 0.0f;
+	static float interval_excess_j = 0.0f;
+	static float interval_available_recovery_j = 0.0f;
+
+#endif
+
+	const uint64_t sample_time_us = time_us_64();
+	const float current_a = (current_raw * I_SENSE_SACLER) / 1000.0f;
+	const float voltage_v = voltage_raw * V_SENSE_SACLER;
+	const float power_w = voltage_v * current_a;
+
+	// Hysteresis prevents ADC noise near the current monitor's upper range
+	// from rapidly entering and leaving the unknown-amplitude overrange
+	// state.
+	if (current_raw >= CURRENT_OVERRANGE_ENTER_RAW)
+		current_sensor_overrange = true;
+	else if (current_raw <= CURRENT_OVERRANGE_EXIT_RAW)
+		current_sensor_overrange = false;
+
+#if POWER_MONITOR_DEBUG_LOG
+
+	// These are reporting-window statistics only. The protection model
+	// below continues to update at the much faster ADC sampling cadence.
+	if (current_sensor_overrange)
+		interval_overrange_seen = true;
+
+	if (current_raw > peak_current_raw)
+		peak_current_raw = current_raw;
+
+#endif
+
+	// Integrate the previous measurement over the time for which it was the
+	// latest sample. This captures 20-50 ms pulses without 100 ms aliasing.
+	if (previous_sample_us != 0) {
+		const float elapsed_s =
+		    (sample_time_us - previous_sample_us) / 1000000.0f;
+
+#if POWER_MONITOR_DEBUG_LOG
+
+		interval_energy_j += previous_power_w * elapsed_s;
+		interval_elapsed_s += elapsed_s;
+		if (previous_power_w > interval_peak_power_w)
+			interval_peak_power_w = previous_power_w;
+		if (previous_power_w > MAX_POWER_TARGET) {
+			interval_excess_j +=
+			    (previous_power_w - MAX_POWER_TARGET) * elapsed_s;
+		} else if (previous_power_w < MAX_POWER_TARGET) {
+			const float headroom_w =
+			    MAX_POWER_TARGET - previous_power_w;
+			const float recovery_w =
+			    headroom_w < POWER_OVERLOAD_RECOVERY_CAP_W
+				? headroom_w
+				: POWER_OVERLOAD_RECOVERY_CAP_W;
+			interval_available_recovery_j += recovery_w * elapsed_s;
+		}
+
+#endif
+		const power_trip_reason_t trip_reason = power_monitor_update(
+		    &POWER_MONITOR, &POWER_MONITOR_LIMITS, previous_power_w,
+		    previous_current_a, previous_current_sensor_overrange,
+		    elapsed_s);
+
+		if (trip_reason != POWER_TRIP_NONE &&
+		    latch_power_trip(trip_reason)) {
+
+#if POWER_MONITOR_DEBUG_LOG
+
+			printf("Power protection tripped: %s "
+			       "(raw I=%u, raw V=%u, %.3fV @ %.3fmA -> %.3fW, "
+			       "%.3fJ, %.3fA*s, clip %.1f/%.1fms)\n",
+			       power_trip_reason_string(trip_reason),
+			       (unsigned)previous_current_raw,
+			       (unsigned)previous_voltage_raw,
+			       previous_voltage_raw * V_SENSE_SACLER,
+			       previous_current_a * 1000.0f, previous_power_w,
+			       POWER_MONITOR.power_overload_j,
+			       POWER_MONITOR.current_overload_a_s,
+			       POWER_MONITOR.current_overrange_continuous_s *
+				   1000.0f,
+			       POWER_MONITOR.current_overrange_exposure_s *
+				   1000.0f);
+#endif
+		}
+	}
+
+	// Preserve this endpoint as the zero-order-held measurement for the
+	// next elapsed interval. This avoids assigning time retroactively to a
+	// new sample.
+	previous_sample_us = sample_time_us;
+	previous_power_w = power_w;
+	previous_current_a = current_a;
+	previous_current_raw = current_raw;
+	previous_voltage_raw = voltage_raw;
+	previous_current_sensor_overrange = current_sensor_overrange;
+
+	// Human-readable diagnostics and shutdown blinking are intentionally
+	// decoupled from protection timing.
+	if (next_readout_us == 0) {
+		next_readout_us =
+		    sample_time_us + (POWER_MON_READOUT_TIME * 1000);
+	} else if (sample_time_us >= next_readout_us) {
+		next_readout_us =
+		    sample_time_us + (POWER_MON_READOUT_TIME * 1000);
+
+		if (power_shut_down)
+			toggle_power_led();
+
+#if POWER_MONITOR_DEBUG_LOG
+
+		const float interval_average_power_w =
+		    interval_elapsed_s > 0.0f
+			? interval_energy_j / interval_elapsed_s
+			: power_w;
+		printf("%.3fV @ %.3f mA -> %.3fW; avg/max %.3f/%.3fW; "
+		       "peak raw %u/%.3f mA%s "
+		       "(P %.3fJ, excess/avail %.3f/%.3fJ, %.3fA*s, "
+		       "clip %.1f/%.1fms)\n",
+		       voltage_v, current_a * 1000.0f, power_w,
+		       interval_average_power_w, interval_peak_power_w,
+		       (unsigned)peak_current_raw,
+		       (peak_current_raw * I_SENSE_SACLER),
+		       interval_overrange_seen ? " OVERRANGE" : "",
+		       POWER_MONITOR.power_overload_j, interval_excess_j,
+		       interval_available_recovery_j,
+		       POWER_MONITOR.current_overload_a_s,
+		       POWER_MONITOR.current_overrange_continuous_s * 1000.0f,
+		       POWER_MONITOR.current_overrange_exposure_s * 1000.0f);
+
+		peak_current_raw = 0;
+		interval_overrange_seen = false;
+		interval_energy_j = 0.0f;
+		interval_elapsed_s = 0.0f;
+		interval_peak_power_w = 0.0f;
+		interval_excess_j = 0.0f;
+		interval_available_recovery_j = 0.0f;
+#endif
+	}
 }
 
 //////////////////////////////////////////////////////////////////////////////////
@@ -88,25 +349,20 @@ void save_midi_config_to_flash(void)
 
 int64_t midi_learn_callback(alarm_id_t id, void* user_data)
 {
-	static bool power_led_state = 0;
-	power_led_state ^= 1;
-
-	// Toggle the power LED
-	if (power_led_state)
-		pwm_set_gpio_level(LED_POWER, UINT8_MAX);
-	else
-		pwm_set_gpio_level(LED_POWER, LOW);
+	if (power_shut_down)
+		return 0;
 
 	// If we are in MIDI learn mode, we want to keep blinking the LED
-	if (is_midi_learn_mode_active())
+	if (is_midi_learn_mode_active()) {
+		toggle_power_led();
 		add_alarm_in_ms(MIDI_LEARN_LED_ON_TIME, midi_learn_callback,
 				NULL, false);
-
-	else // Save the MIDI config to flash and turn on the LED
-	{
+	}
+	// Save the MIDI config to flash and turn on the LED
+	else {
 		pwm_set_gpio_level(LED_POWER, UINT8_MAX);
 		save_midi_config_to_flash();
-		MIDI_LEARNED = *flash_buffer;
+		MIDI_LEARNED = *midi_config_flash;
 	}
 
 	return 0;
@@ -167,6 +423,14 @@ void handle_trigger_off(out_channel_t ch)
 // executed in irq handler
 void on_pwm_wrap(void)
 {
+	// The latch is the final output gate: stale MIDI/CV state cannot
+	// re-energize an output after shut_down_outputs() has forced the pins
+	// low.
+	if (power_shut_down) {
+		pwm_clear_irq(pwm_gpio_to_slice_num(LED1));
+		return;
+	}
+
 	if (!is_midi_learn_mode_active()) {
 		static bool switched_to_trigger[N_CHANNELS] = {0};
 
@@ -191,12 +455,14 @@ void on_pwm_wrap(void)
 		}
 	} else {
 		// dimmly light up current LED that needs to assigned
-		if (get_midi_learn_note_counter() <= N_CHANNELS)
+		if (get_midi_learn_note_counter() < N_CHANNELS)
 			pwm_set_gpio_level(
 			    LED_PIN[get_midi_learn_note_counter()],
 			    MIDI_LEARN_DIM_LED_STRENGTH);
 #if PWM_CONTROL_TYPE == MIDI_CC
-		else
+		else if (get_midi_learn_cc_counter() +
+			     get_midi_learn_note_counter() >=
+			 N_CHANNELS)
 			pwm_set_gpio_level(LED_PIN[get_midi_learn_cc_counter()],
 					   MIDI_LEARN_DIM_LED_STRENGTH);
 #endif
@@ -215,6 +481,9 @@ void on_uart_rx()
 	uint8_t incoming[1];
 	while (uart_is_readable(UART_ID)) {
 		incoming[0] = (uint8_t)uart_getc(UART_ID);
+		if (power_shut_down)
+			continue;
+
 		if (is_midi_learn_mode_active())
 			midi_parse(&MIDI_LEARN_PARSER, incoming, 1);
 		else
@@ -276,6 +545,8 @@ int main()
 	///////////////////////////////////////
 
 	adc_gpio_init(ADC_PIN + CAPTURE_CHANNEL);
+	adc_gpio_init(I_SENSE_PIN);
+	adc_gpio_init(V_SENSE_PIN);
 
 	adc_init();
 	adc_select_input(CAPTURE_CHANNEL);
@@ -305,6 +576,20 @@ int main()
 		gpio_set_dir(PULSE_OUT_PIN[ch], GPIO_OUT);
 		gpio_set_dir(OUT_SEL_PIN[ch], GPIO_IN);
 		gpio_set_dir(CV_WATCH_PIN[ch], GPIO_IN);
+	}
+
+	gpio_set_function(PR3_PLUS_PIN, GPIO_FUNC_SIO);
+	gpio_set_dir(PR3_PLUS_PIN, GPIO_IN);
+
+	if (gpio_get(PR3_PLUS_PIN)) {
+		// PR3 and higher
+		pr3_or_higher = true;
+#if POWER_MONITOR_DEBUG_LOG
+		stdio_init_all();
+#endif
+	} else {
+		// PR1 or PR2 -> no power monitoring
+		pr3_or_higher = false;
 	}
 
 	///////////////////////////////////////
@@ -362,7 +647,7 @@ int main()
 	// Get MIDI Config from Flash
 	///////////////////////////////////////
 
-	MIDI_LEARNED = *flash_buffer;
+	MIDI_LEARNED = *midi_config_flash;
 
 	if (!gpio_get(MIDI_LEARN_PIN)) {
 		set_midi_learn_mode(true);
@@ -388,7 +673,7 @@ int main()
 			     MIDI_LEARN_HOLD_OFF_TIME)) {
 				set_midi_learn_mode(false);
 				save_midi_config_to_flash();
-				MIDI_LEARNED = *flash_buffer;
+				MIDI_LEARNED = *midi_config_flash;
 			}
 		}
 
@@ -402,6 +687,7 @@ int main()
 
 	// entropy source is pot positions
 	uint16_t r_seed = 0;
+	adc_select_input(CAPTURE_CHANNEL);
 
 	switch_to(&MUX, MUX_4051_CH_0);
 	r_seed += adc_read_accurate(SAMPLE_MULTIPLIER);
@@ -418,6 +704,13 @@ int main()
 	star_blinking_sequence(r_seed);
 
 	///////////////////////////////////////
+	// POWER MONITORING
+	///////////////////////////////////////
+
+	if (pr3_or_higher)
+		power_monitor_reset(&POWER_MONITOR);
+
+	///////////////////////////////////////
 	// Enable Interrupts
 	///////////////////////////////////////
 
@@ -428,33 +721,68 @@ int main()
 	// MAIN LOOP (LOWEST PRIORITY)
 	///////////////////////////////////////
 
-	// sampling each input @ ~2.4 kHz
+	// Continuously sample the controls and power sensors.
 	while (1) {
 		// looping in gray code fashion to only change on pin at
 		// the time https://en.wikipedia.org/wiki/Gray_code
 
-		switch_to(&MUX, MUX_4051_CH_0);
-		ADC_VALUES.pot[CHAN_1] = adc_read_accurate(SAMPLE_MULTIPLIER);
+		adc_select_input(CAPTURE_CHANNEL);
 
-		switch_to(&MUX, MUX_4051_CH_1);
-		ADC_VALUES.cv[CHAN_1] = adc_read_accurate(SAMPLE_MULTIPLIER);
+		if (!power_shut_down) {
+			switch_to(&MUX, MUX_4051_CH_0);
+			ADC_VALUES.pot[CHAN_1] =
+			    adc_read_accurate(SAMPLE_MULTIPLIER);
 
-		switch_to(&MUX, MUX_4051_CH_3);
-		ADC_VALUES.pot[CHAN_2] = adc_read_accurate(SAMPLE_MULTIPLIER);
+			switch_to(&MUX, MUX_4051_CH_1);
+			ADC_VALUES.cv[CHAN_1] =
+			    adc_read_accurate(SAMPLE_MULTIPLIER);
 
-		switch_to(&MUX, MUX_4051_CH_2);
-		ADC_VALUES.cv[CHAN_2] = adc_read_accurate(SAMPLE_MULTIPLIER);
+			switch_to(&MUX, MUX_4051_CH_3);
+			ADC_VALUES.pot[CHAN_2] =
+			    adc_read_accurate(SAMPLE_MULTIPLIER);
 
-		switch_to(&MUX, MUX_4051_CH_6);
-		ADC_VALUES.cv[CHAN_4] = adc_read_accurate(SAMPLE_MULTIPLIER);
+			switch_to(&MUX, MUX_4051_CH_2);
+			ADC_VALUES.cv[CHAN_2] =
+			    adc_read_accurate(SAMPLE_MULTIPLIER);
 
-		switch_to(&MUX, MUX_4051_CH_7);
-		ADC_VALUES.pot[CHAN_4] = adc_read_accurate(SAMPLE_MULTIPLIER);
+			switch_to(&MUX, MUX_4051_CH_6);
+			ADC_VALUES.cv[CHAN_4] =
+			    adc_read_accurate(SAMPLE_MULTIPLIER);
 
-		switch_to(&MUX, MUX_4051_CH_5);
-		ADC_VALUES.pot[CHAN_3] = adc_read_accurate(SAMPLE_MULTIPLIER);
+			switch_to(&MUX, MUX_4051_CH_7);
+			ADC_VALUES.pot[CHAN_4] =
+			    adc_read_accurate(SAMPLE_MULTIPLIER);
 
-		switch_to(&MUX, MUX_4051_CH_4);
-		ADC_VALUES.cv[CHAN_3] = adc_read_accurate(SAMPLE_MULTIPLIER);
+			switch_to(&MUX, MUX_4051_CH_5);
+			ADC_VALUES.pot[CHAN_3] =
+			    adc_read_accurate(SAMPLE_MULTIPLIER);
+
+			switch_to(&MUX, MUX_4051_CH_4);
+			ADC_VALUES.cv[CHAN_3] =
+			    adc_read_accurate(SAMPLE_MULTIPLIER);
+		} else {
+			// shut down triggered -> disable all outputs
+
+			ADC_VALUES.pot[CHAN_1] = 0;
+			ADC_VALUES.cv[CHAN_1] = 0;
+			ADC_VALUES.pot[CHAN_2] = 0;
+			ADC_VALUES.cv[CHAN_2] = 0;
+			ADC_VALUES.cv[CHAN_4] = 0;
+			ADC_VALUES.pot[CHAN_4] = 0;
+			ADC_VALUES.pot[CHAN_3] = 0;
+			ADC_VALUES.cv[CHAN_3] = 0;
+		}
+
+		if (pr3_or_higher) {
+			adc_select_input(I_SENSE_ADC_CHANNEL);
+
+			const uint16_t current_sample = adc_read_accurate(255);
+
+			adc_select_input(V_SENSE_ADC_CHANNEL);
+
+			const uint16_t voltage_sample = adc_read_accurate(255);
+
+			process_power_sample(current_sample, voltage_sample);
+		}
 	}
 }

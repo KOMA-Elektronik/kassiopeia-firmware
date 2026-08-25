@@ -1,0 +1,142 @@
+let LATEST_FW_MAJOR = 1
+let LATEST_FW_MINOR = 0
+
+let bin_dir = "bin"
+let bin_name = "kassiopeia_fw"
+let midi_default_path = "bin/midi_default_values.bin"
+
+////////////////////////////////////////////////////////////////////////////////
+// HELPERS
+////////////////////////////////////////////////////////////////////////////////
+
+fun exit_program() {
+    echo "\n--- Kassiopeia out ---"
+    exit 1
+}
+
+fun read_input() : Text {
+    return trust $read -r input; echo -n \$input$
+}
+
+fun get_path_to_fw_binary(dir: Text, name: Text, major: Num, minor: Num) : Text {
+    return dir + "/" + name + "_" + major as Text + "_" + minor as Text + ".bin"
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// SUCCESS FUNCTIONS
+////////////////////////////////////////////////////////////////////////////////
+
+fun success_connection() {
+    echo "##############################################################"
+    echo "# Kassiopeia has been recognized and is ready to be flashed! #"
+    echo "##############################################################\n"
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// CHECK FUNCTIONS
+////////////////////////////////////////////////////////////////////////////////
+
+fun check_tooling() {
+    silent $picotool version$ failed {
+        echo "picotool is not found in PATH."
+        echo "Please install via your preferred package manager or use 'nix-shell -p picotool' if you have nix installed"
+        exit_program()
+    }
+}
+
+
+fun check_connection() {
+    silent $picotool info$?
+    success_connection()
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// FLASHING FUNCTIONS
+////////////////////////////////////////////////////////////////////////////////
+
+fun flash_firmware(major_version: Num, minor_version: Num) {
+    $picotool load -v {get_path_to_fw_binary(bin_dir, bin_name, major_version, minor_version)}$?
+}
+
+fun flash_midi_default_config() {
+    // offset is determined in 'kassiopeia-code/system/inc/config.h' and keep in mind that the flash starts at 0x10000000
+    $picotool load -nuv -o 0x101FF000 {midi_default_path}$?
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// BUSINESS LOGIC
+////////////////////////////////////////////////////////////////////////////////
+
+fun fresh_install() {
+    echo "Make sure the Kassiopeia is connected in Bootloader mode via USB!"
+
+    loop {
+        echo "\nPress 'Enter' to flash or 'e' to exit: "
+
+        if read_input() == "e": break;
+
+        check_connection() failed {
+            echo "Can't find USB device."
+            echo "Please open the Kassiopeia device (from the bottom) and press the 'Firmware Update' button while powering."
+        }
+
+        echo "Transfer latest firmware!"
+        flash_firmware(LATEST_FW_MAJOR, LATEST_FW_MINOR) failed {
+            echo "Couldn't upload firmware"
+        }
+
+        echo "Transfer MIDI default values!"
+        flash_midi_default_config() failed {
+            echo "Couldn't upload default MIDI values"
+        }
+
+        echo "Transfer secret binary blob!"
+        echo "TBD"
+
+        echo "I will now reboot the device..."
+
+        trust $picotool reboot$
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// MAIN ENTRY
+////////////////////////////////////////////////////////////////////////////////
+
+main {
+    echo "\n--- Kassiopeia FW Flasher ---"
+    echo check_tooling()
+
+    let mode = ""
+
+    loop {
+        echo "Is this the first time this device will be flashed (y/n)?"
+        let choice = read_input()
+
+        if {
+            // fresh mode
+            choice == "y": mode = "fresh"
+            choice == "yes": mode = "fresh"
+            choice == "Y": mode = "fresh"
+            choice == "YES": mode = "fresh"
+
+            // seasoned mode
+            choice == "n": mode = "seasoned"
+            choice == "N": mode = "seasoned"
+            choice == "no": mode = "seasoned"
+            choice == "No": mode = "seasoned"
+        }
+
+        if {
+            mode == "fresh": break
+            mode == "seasoned": break
+        }
+    }
+
+    if {
+        mode == "fresh": fresh_install()
+        mode == "seasoned": echo "empty, bye bye"
+    }
+
+    exit_program()
+}

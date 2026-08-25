@@ -1,4 +1,5 @@
 add_library(system
+    src/power_monitor.c
     src/startup_sequence.c
 )
 

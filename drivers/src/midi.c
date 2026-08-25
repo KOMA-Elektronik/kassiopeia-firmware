@@ -188,14 +188,16 @@ void handle_midi_learn_msg(struct midi_msg* msg)
 
 #if PWM_CONTROL_TYPE == MIDI_CC
 	case MIDI_CONTROL_CHANGE:
-		switch (midi_learn_cc_counter) {
-		case CHAN_1:
+		// make sure all CC messages are ignored while notes are being
+		// configured
+		switch (midi_learn_cc_counter + midi_learn_note_counter) {
+		case CHAN_1 + N_CHANNELS:
 			start_pulse(CHAN_1, MIDI_LEARN_LED_ON_TIME);
 			MIDI_LEARNED.cc_channel[CHAN_1] = msg->channel;
 			MIDI_LEARNED.cc[CHAN_1] = msg->data[0];
 			midi_learn_cc_counter++;
 			break;
-		case CHAN_2:
+		case CHAN_2 + N_CHANNELS:
 			if (msg->data[0] == MIDI_LEARNED.cc[CHAN_1] &&
 			    msg->channel == MIDI_LEARNED.cc_channel[CHAN_1])
 				break; // double assignment is illegal
@@ -205,7 +207,7 @@ void handle_midi_learn_msg(struct midi_msg* msg)
 			MIDI_LEARNED.cc[CHAN_2] = msg->data[0];
 			midi_learn_cc_counter++;
 			break;
-		case CHAN_3:
+		case CHAN_3 + N_CHANNELS:
 			if ((msg->data[0] == MIDI_LEARNED.cc[CHAN_1] &&
 			     msg->channel == MIDI_LEARNED.cc_channel[CHAN_1]) ||
 			    (msg->data[0] == MIDI_LEARNED.cc[CHAN_2] &&
@@ -217,7 +219,7 @@ void handle_midi_learn_msg(struct midi_msg* msg)
 			MIDI_LEARNED.cc[CHAN_3] = msg->data[0];
 			midi_learn_cc_counter++;
 			break;
-		case CHAN_4:
+		case CHAN_4 + N_CHANNELS:
 			if ((msg->data[0] == MIDI_LEARNED.cc[CHAN_1] &&
 			     msg->channel == MIDI_LEARNED.cc_channel[CHAN_1]) ||
 			    (msg->data[0] == MIDI_LEARNED.cc[CHAN_2] &&
