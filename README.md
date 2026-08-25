@@ -65,6 +65,11 @@ Make sure the Kassiopeia is in bootloader mode!
 $ picotool load build/kassiopeia.bin && picotool reboot
 ```
 
+or run
+```bash
+$ ./flash_kassiopeia.sh  # and follow instructions
+```
+
 ### Upload to hardware (hard mode)
 
 Make sure that you have a probe that supports multicore uploading. Easiest is the [picoprobe](https://github.com/raspberrypi/picoprobe) where you use a RP Pico as debug probe. 

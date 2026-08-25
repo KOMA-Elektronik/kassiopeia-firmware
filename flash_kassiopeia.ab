@@ -1,5 +1,5 @@
 let LATEST_FW_MAJOR = 1
-let LATEST_FW_MINOR = 0
+let LATEST_FW_MINOR = 1
 
 let bin_dir = "bin"
 let bin_name = "kassiopeia_fw"
